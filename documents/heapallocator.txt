@@ -1,0 +1,48 @@
+NAME(s)
+Siyu Yang <siyu> and Shan Lu <shanlu>
+
+DESIGN
+Our allocator employs an implicit linked list to keep track of blocks of free memory on the heap segment. The free list is organized as an array of blocks of at least 16 bytes. Each block has a 4-byte header at the beginning and a 4-byte footer at the end, which records the size of the block as an int, with the least significant bit serving as an indicator of whether it’s free or allocated (the last 4 bytes are always 0 for blocks that has a size that is a multiple of 16). The footer serves to doubly link the free list so we can coalesce blocks in front. The free list has a ‘prologue’ (8 bytes) and an ‘epilogue’  (4 bytes) at each end, which are marked as ‘allocated’ to prevent overstepping the segment boundaries during coalescing. The ‘epilogue’ block has a size of 0 to mark the end of the heap segment.
+
+There are three void* global variables to record the start and end of the heap segment, and a last_stop to be used by find_fit (see Optimization).
+
+Our placement policy is next fit. When malloc is asked to allocate n bytes of memory, we first round it up to a multiple of 8 that is at least 16.
+find_fit() then conducts a linear traversal through the free list, locating the next block by adding the current block’s size to its pointer, and the first block encountered that’s both big enough and free will be returned. The block is not divided and so additional internal fragmentation other than the header and footer could take place. The linear traversal is N-time in the worst case where N is the total number of blocks on the segment.
+
+To reduce external fragmentation, a freed block is immediately coalesced with its two neighbors. This is done by examining the ‘allocated’ status of the previous and next blocks and if one or both are free, the overhead is rewritten with the new, larger size.
+
+Our realloc() is designed with the assumption that once a pointer is realloc’ed, it is likely to be realloc’ed again, so any extra space that so happen to be there is not divided and coalesce (generous when assigning memory). It considers the requested pointer under four cases in turn: new size is smaller than the old size, the next block is free and has enough space for the additional payload, the previous block has enough space for the additional payload, and lastly none of these and so a new block is malloc’ed and the old pointer is freed. The cases are laid out in that order because each successive operation is more expansive: The first two does not require memmove(), the first three does not need coalescing when free() is called.
+
+
+RATIONALE
+
+OPTIMIZATIONwitched to the implicit free list design (first fit to begin with, later switched to next fit) after working on a buddy system design for two days. We were initially fascinated by the idea of being able to locate the block’s buddy address by using xor, and the speed it will bring to coalescing. However, when we were trying to flip the bit accordingly, the freelist result after each run varied. In theory, the buddy address is determined by both the address of current block and its size. This was due to the fact that we found buddy blocks by calculating absolute address rather than relative address at the beginning. Since each time the start address of heap was given by operating system differently, our buddy calculation varied from time to time.
+
+On the other hand, we were aware that internal fragmentation is inevitably large because of the power of 2 constraint, but decided to go ahead. Although we made it work, both its utilization and throughput were initially lower than 40%, and because of the delicacy of the doubly linked list we used for each bucket and the complexity of our code, we were wary of potential bugs. The power of 2 constraint made our program very sensitive to input sizes, and as we read more of the literature on the buddy system, we realized that it’s not ideal for a general-purpose allocator. The prospect of an implicit list design seemed more desirable because it would be more tightly fitted for at least the initial malloc calls, and is very cache-friendly, coalescing with neighboring blocks. Wise decision was made, and with the experience earned from previous failed implementation, we switched to current version without too much extra time.
+
+OPTIMIZATION
+After setting the optimization flag to 2, 3, and 4, the result converges to 82% and 45% in terms of utilization and throughput, respectively. However, the throughput was still far from full credit mark and we judged that this low throughput came from our current allocation strategy. An obvious improvement to realloc() is to eliminate cases where the complete malloc, copy, free routine are required. And so we wrote our realloc() as described above, avoiding mallocing new space and shrink to fit. Comparing the result of the entire range of test files in slink, we find that it did not improve throughput by a noticeable amount. We kept it like that though, in case there is a realloc() intensive program.
+
+At office hour on Monday, Kent suggested that we could try mallocing more space than requested by realloc() as it is likely to be realloc’ed again. This gave a ~3% improvement to throughput at the cost of around 15% in utilization. We incorporated this trade-off for higher throughput by mallocing three times as much as the new size, as our utilization was above 80%.
+
+The callgrind report on frequency of function calls was generated and we find that, as expected, find_fit() and coalesce() were used the most, along with the helper functions like get_size() and get_header().
+
+Looking at the cache report generated by callgrind, we feel that not much could be improved as both find_fit() and coalesce() examine the heap either in order or looking at its neighbors thus using nearby memory blocks. The hit rate was indeed very high for these functions.
+
+One throughput limitation inherent in the first fit placement policy that we started with is the linear traversal when find_fit() is called. We visualized its process and thought that once a few malloc calls have been made, the linear traversal has to go through a lot of allocated blocks before reaching any free ones, especially for programs that free all its memory at the end. We then changed our program to have a global variable last_stop to record where the previous find_fit() has reached, and ask subsequence find_fit() to start searching from there. We also update it when a block is coalesced, as there is a good chance that the newly coalesced block is large enough for the next malloc need. However, we had to update it in realloc() too to avoid having find_fit() pointing to anywhere that’s no longer a base pointer of the entire block. The throughput improved dramatically to around 80%.
+
+We did not opt for delayed coalescing because it was relatively inexpensive (constant time) to check and change the header of neighboring blocks, which are highly likely to be in the cache memory.
+
+EVALUATION
+The strengths of our current program include the simplicity of its data structure while achieving a good level of utilization (ranging from 30% for realloc-pattern-2 to 90% of sawtooth-pattern), and a fairly high throughput across a range of input patterns (the lowest is surprise pattern at 310 requests per second, with the majority in the thousands). Both the average utilization and throughput as well as the minimum for each are satisfactory, demonstrating the general applicability of our allocator. Another advantage is how easily the trade-off between utilization and throughput can be made to adapt to memory-sensitive applications: if we want higher utilization (~80%), we can simply change the next-fit placement policy to first-fit, which we started off with.
+
+A weakness of our allocator is that its throughput is limited by the traversal of the free list. A more sophisticated hash table based segregated list might be able to provide higher throughput at the cost of the complexity of the code. Moreover, the next-fit policy will eventually leave a large amount of external fragmentation. The 8-byte overhead (header and footer) seems fairly expensive, but we did not know how to use a 4-byte overhead in either the buddy system or this allocator that still satisfies the 8-alignment requirement.
+
+
+1. Bryant, Randal E. 2011. Computer Systems: A programmer’s Perspective (custom edition for Stanford University), Pearson Education: New Jersey.  p827 - 838 (Putting It Together: Implementing a Simple Allocator)
+
+2. Memory Management Reference. [Online] http://www.memorymanagement.org/mmref/alloc.html, accessed 9 August 2014.
+
+3. Smith, Jeffery. 2012. Implementing Memory Management Using the Buddy System. [Online] http://www.cs.uml.edu/~jsmith/OSReport/frames.html, accessed 9 August 2014.
+
+Special thanks to the grateful help offered by Michael Chang and our TA Kent.
